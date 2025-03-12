@@ -1,3 +1,10 @@
+
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
+
+
 #include<stdio.h>
 #include<errno.h>
 #include<unistd.h>
@@ -6,14 +13,25 @@
 #include<ctype.h>
 #include<sys/ioctl.h>
 #include<string.h>
+#include<sys/types.h>
 
-// struct termios orig_termios;
+
+
+ //stores rows of text to be  displayed
+typedef struct erow{
+    int size;
+    char *chars;
+}erow;
 
 struct editor_config{
     int crsr_x, crsr_y; //x and y position of cursor
     struct termios orig_termios;
+    int row_offset;
+    int col_offset;
     int screenrows;
     int screencols;
+    int numrows;
+    erow * row;
 } E;
 
 
@@ -147,28 +165,35 @@ int get_cursor_position(int * rows, int * cols){
 }
 
 void editor_movecursor(int key){
+
+    erow *row = (E.crsr_y>=E.numrows) ? NULL : &E.row[E.crsr_y];
     switch(key){
-        case ARROW_LEFT:
+        case ARROW_UP:
             if(E.crsr_x!=0){
                 E.crsr_x--;
             }
             break;
-        case ARROW_RIGHT:
-            if(E.crsr_x!=E.screencols-1){
+        case ARROW_DOWN:
+            if(row && E.crsr_x < row ->size){
                 E.crsr_x++;
             }
             break;
-        case ARROW_UP:
+        case ARROW_LEFT:
             if(E.crsr_y!=0){
                 E.crsr_y--;
             }
             break;
-        case ARROW_DOWN:
-        if(E.crsr_y!=E.screenrows-1){
+        case ARROW_RIGHT:
+        if(E.crsr_y<E.numrows){
             E.crsr_y++;
         }
         break;
     }
+     row = (E.crsr_y >= E.numrows) ? NULL : &E.row[E.crsr_y];
+     int rowlen = row ? row->size : 0;
+     if(E.crsr_x > rowlen){
+        E.crsr_x = rowlen;
+     }
 }
 
 
@@ -224,8 +249,39 @@ int get_window_size(int * rows, int * cols){
         *rows = ws.ws_row;
         return 0;
     }
+}
+ 
 
-    
+void editor_append_row(char *s, size_t len){
+    E.row = realloc(E.row, sizeof(erow) *(E.numrows + 1));
+
+
+    int at = E.numrows;
+    E.row[at].size = len;
+    E.row[at].chars = malloc(len+1);
+    memcpy(E.row[at].chars, s, len);
+    E.row->chars[len] = '\0';
+    E.numrows ++;
+}
+void editor_open(char *filename){
+
+    FILE *fp = fopen(filename,"r");
+    if(!fp) die("fopen");
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t line_len;
+
+    while((line_len = getline(&line, &linecap, fp))!= -1){
+        while(line_len > 0 && (line[line_len - 1] == '\n' || line[line_len-1]== '\r')) line_len--;
+        editor_append_row(line, line_len);
+    }
+
+    free(line);
+    free(fp);
+
+
+
+
 }
 struct abuf{
     char *b;
@@ -247,21 +303,45 @@ void ab_free(struct abuf *ab){
     free(ab->b);
 }
 
+void editor_scroll(){
+    if(E.crsr_y < E.row_offset){
+        E.row_offset = E.crsr_y;
+    }
+    if(E.crsr_y >= E.row_offset + E.screenrows){
+        E.row_offset = E.crsr_y - E.screenrows + 1;
+    }
+    if(E.crsr_x < E.col_offset){
+        E.col_offset = E.crsr_x;
+    }
+    if(E.crsr_x>= E.col_offset + E.screencols){
+        E.col_offset = E.crsr_x - E.screencols + 1;
+    }
+}
+
 void draw_tildes(struct abuf *ab){
     int y;
     for(y = 0; y < E.screenrows ; y++){
-        if( y == E.screenrows/3){
-            char Welcome[80];
-            int welcomelen = snprintf(Welcome, sizeof(Welcome), "secant texteditor --version %s", SECANT_VERSION);
-            if(welcomelen>E.screencols) welcomelen=E.screencols;
-            int padding = (E.screencols-welcomelen)/2;if(padding){
-                ab_append(ab, "~",1);
-                padding--;
+        int effective_row = y + E.row_offset;
+        if(effective_row>= E.numrows){
+            if( y == E.screenrows/3 && E.numrows == 0){
+                char Welcome[80];
+                int welcomelen = snprintf(Welcome, sizeof(Welcome), "secant texteditor --version %s", SECANT_VERSION);
+                if(welcomelen>E.screencols) welcomelen=E.screencols;
+                int padding = (E.screencols-welcomelen)/2;
+                if(padding){
+                    ab_append(ab, "~",1);
+                    padding--;
+                }
+                while(padding--) ab_append(ab, " ", 1);
+                ab_append(ab, Welcome, welcomelen);
+            }else{
+                ab_append(ab, "~", 1);
             }
-            while(padding--) ab_append(ab, " ", 1);
-            ab_append(ab, Welcome, welcomelen);
         }else{
-            ab_append(ab, "~", 1);
+            int  len = E.row[effective_row].size - E.col_offset;
+            if(len<0) len =0;
+            if(len > E.screencols) len = E.screencols;
+            ab_append(ab, &E.row[effective_row].chars[E.col_offset], len);
         }
 
         ab_append(ab, "\x1b[K", 3);
@@ -275,6 +355,7 @@ void draw_tildes(struct abuf *ab){
 // refreshes screen
 
 void editor_refresh_screen(){
+    editor_scroll();
     struct abuf ab = ABUF_INIT;
 
     ab_append(&ab, "\x1b[25?l", 6);
@@ -286,7 +367,7 @@ void editor_refresh_screen(){
 
     char buff[32];
 
-    snprintf(buff, sizeof(buff), "\x1b[%d;%dH", E.crsr_x+1, E.crsr_y+1);
+    snprintf(buff, sizeof(buff), "\x1b[%d;%dH", (E.crsr_y-E.row_offset)+1, E.crsr_x+1);
     ab_append(&ab, buff, strlen(buff));
 
     // ab_append(&ab, "\x1b[H", 3);
@@ -298,16 +379,23 @@ void editor_refresh_screen(){
 }
 
 void init_editor(){
-
+    E.row = NULL;
     E.crsr_x = 0;
     E.crsr_y = 0;
+    E.numrows = 0;
+    E.row_offset = 0;
+    E.col_offset = 0;
     if (get_window_size(&E.screenrows, &E.screencols) == -1) die("get_window_size");
 }
 
 
-int main(){
+int main(int argc, char*argv[]){
     enable_raw_mode();
     init_editor();
+
+    if(argc >=2){
+        editor_open(argv[1]);
+    }
     
     while(1){
         process_keystrokes();
